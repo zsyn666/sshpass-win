@@ -1,4 +1,5 @@
 /target/
 /.cargo-home/
 /.build-tmp/
+/dist/
 *.pdb

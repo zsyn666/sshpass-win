@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "description": "A drop-in sshpass for Windows: native password authentication for ssh, scp and sftp",
+  "homepage": "https://github.com/zsyn666/sshpass-win",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/zsyn666/sshpass-win/releases/download/v1.0.0/sshpass.exe",
+      "hash": "cee51ffa19f018ac5e8daba2a01ca7583a0eb5c72ed0b0d66b50ef1a3e533558"
+    }
+  },
+  "bin": "sshpass.exe",
+  "checkver": {
+    "github": "https://github.com/zsyn666/sshpass-win"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/zsyn666/sshpass-win/releases/download/v$version/sshpass.exe"
+      }
+    }
+  }
+}

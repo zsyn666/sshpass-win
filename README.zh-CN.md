@@ -24,14 +24,33 @@
 
 ## 安装
 
+**Scoop**
+
 ```powershell
-Invoke-WebRequest https://github.com/<you>/sshpass-win/releases/latest/download/sshpass.exe -OutFile "$env:USERPROFILE\.local\bin\sshpass.exe"
+scoop bucket add zsyn666 https://github.com/zsyn666/sshpass-win
+scoop install sshpass-win
 ```
 
-或从源码安装（需要 Rust）：
+**WinGet**（manifest PR 合并后）
 
 ```powershell
-cargo install --git https://github.com/<you>/sshpass-win --bin sshpass
+winget install zsyn666.sshpass-win
+```
+
+**安装器** — 从 [Releases](https://github.com/zsyn666/sshpass-win/releases) 下载
+`sshpass-win-<version>-x64-setup.exe`。按用户安装到
+`%LOCALAPPDATA%\Programs\sshpass-win`，并把该目录加入用户 `PATH`；卸载时自动移除。
+
+**便携版** — 把 `sshpass.exe` 放到 `PATH` 上任意目录：
+
+```powershell
+Invoke-WebRequest https://github.com/zsyn666/sshpass-win/releases/latest/download/sshpass.exe -OutFile "$env:USERPROFILE\.local\bin\sshpass.exe"
+```
+
+**从源码**（需要 Rust）：
+
+```powershell
+cargo install --git https://github.com/zsyn666/sshpass-win --bin sshpass
 ```
 
 要求 Windows 10 1809+（ConPTY）与 Windows OpenSSH 8.4+（`SSH_ASKPASS_REQUIRE`），系统默认自带。
@@ -120,6 +139,16 @@ At most one of -f, -d, -p or -e should be used.
 - `askpass` 路径看不到主机密钥提示，因为 ssh 在无终端时会自动接受未知密钥。需要原版的主机密钥拒绝行为时用 `SSHPASS_RS_ENGINE=pty`。
 - `pty` 引擎会把 stdout 和 stderr 合并，因为 ConPTY 把两者都接到控制台；`askpass` 引擎保持分离，脚本里重定向 stderr 时优先用后者。
 
+## 发布
+
+推送 `v1.0.0` 这类 tag。`.github/workflows/release.yml` 会跑格式与测试门禁，构建
+`sshpass.exe`、便携 zip 和 Inno Setup 安装器，发布并附 SHA-256 校验和，然后更新
+`main` 上的 Scoop 与 WinGet manifest。
+
+WinGet 上架是向 `microsoft/winget-pkgs` 提 PR：把具有 `public_repo` 权限的经典 PAT
+存为仓库 secret `WINGET_TOKEN`，再手动运行 **Submit to WinGet** workflow 并填入版本号。
+PR 合并后即可 `winget install zsyn666.sshpass-win`。
+
 ## 安全
 
 - **`-p` 会把密码暴露在进程列表里**（与原版相同），优先用 `-e`、`-f` 或 stdin。
@@ -130,7 +159,7 @@ At most one of -f, -d, -p or -e should be used.
 ## 从源码构建
 
 ```powershell
-git clone https://github.com/<you>/sshpass-win
+git clone https://github.com/zsyn666/sshpass-win
 cd sshpass-win
 cargo build --release --bin sshpass
 # target\release\sshpass.exe

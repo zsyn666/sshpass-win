@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $event = "${{ github.event_name }}"
+          if ($event -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.].+)?$') {
+            throw "Invalid version: $version"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        run: cargo test --features test-helpers --lib --bins --test cli -- --test-threads=1
+
+      - name: Build
+        run: cargo build --release --bin sshpass
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command iscc).Source }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" "installer\sshpass-win.iss"
+
+      - name: Assemble assets
+        id: assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\sshpass.exe dist\sshpass.exe -Force
+          Copy-Item LICENSE, README.md dist\ -Force
+          Compress-Archive -Path dist\sshpass.exe, dist\LICENSE, dist\README.md `
+            -DestinationPath "dist\sshpass-win-$version-x64.zip" -Force
+          $setup = Get-ChildItem dist -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "installer was not produced" }
+          $exeHash = (Get-FileHash dist\sshpass.exe -Algorithm SHA256).Hash.ToLower()
+          $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$exeHash  sshpass.exe"
+            "$setupHash  $($setup.Name)"
+          ) | Set-Content dist\SHA256SUMS.txt
+          "exe_hash=$exeHash" >> $env:GITHUB_OUTPUT
+          "setup_hash=$setupHash" >> $env:GITHUB_OUTPUT
+          "setup_name=$($setup.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: sshpass-win ${{ steps.version.outputs.value }}
+          generate_release_notes: true
+          body: |
+            Native `sshpass` for Windows: password authentication for `ssh`, `scp` and `sftp` without MSYS, Cygwin or a pty.
+
+            **Downloads**
+            - `sshpass.exe` — single-file portable executable
+            - `sshpass-win-${{ steps.version.outputs.value }}-x64.zip` — executable with README and LICENSE
+            - `sshpass-win-${{ steps.version.outputs.value }}-x64-setup.exe` — per-user installer (adds `sshpass` to PATH)
+
+            **Install with Scoop**
+            ```powershell
+            scoop bucket add zsyn666 https://github.com/zsyn666/sshpass-win
+            scoop install sshpass-win
+            ```
+
+            **Install with WinGet** (after the manifest PR is merged)
+            ```powershell
+            winget install zsyn666.sshpass-win
+            ```
+
+            SHA-256 checksums are in `SHA256SUMS.txt`.
+          files: |
+            dist/sshpass.exe
+            dist/sshpass-win-${{ steps.version.outputs.value }}-x64.zip
+            dist/${{ steps.assets.outputs.setup_name }}
+            dist/SHA256SUMS.txt
+
+      - name: Update Scoop and WinGet manifests
+        shell: pwsh
+        run: |
+          ./tools/update-manifests.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -ExeHash "${{ steps.assets.outputs.exe_hash }}" `
+            -SetupHash "${{ steps.assets.outputs.setup_hash }}" `
+            -SetupName "${{ steps.assets.outputs.setup_name }}"
+
+      - name: Commit manifest updates
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket winget
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          git commit -m "chore: update install manifests for v${{ steps.version.outputs.value }}"
+          git push origin HEAD:main

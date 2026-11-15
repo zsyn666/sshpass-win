@@ -1,0 +1,45 @@
+name: Submit to WinGet
+
+# WinGet packages are published by opening a pull request against
+# microsoft/winget-pkgs. This workflow does that with WinGetCreate.
+# Create a classic PAT with "public_repo" and store it as WINGET_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to submit (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinGetCreate
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WinGetCreate --silent `
+            --accept-package-agreements --accept-source-agreements
+          # The installer puts wingetcreate.exe in WindowsApps; make sure the
+          # rest of the job can find it without a new login.
+          "$env:LOCALAPPDATA\Microsoft\WindowsApps" | Out-File -Append $env:GITHUB_PATH
+
+      - name: Submit manifest
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            throw "Set the WINGET_TOKEN repository secret to a classic PAT with public_repo scope."
+          }
+          $manifest = "winget\manifests\z\zsyn666\sshpass-win\${{ inputs.version }}"
+          if (-not (Test-Path $manifest)) {
+            throw "Manifest not found: $manifest. Run a release first."
+          }
+          wingetcreate submit --token $env:WINGET_TOKEN $manifest

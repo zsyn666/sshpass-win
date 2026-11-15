@@ -29,16 +29,34 @@ Password authentication for `ssh`, `scp` and `sftp` — native, no MSYS, no Cygw
 
 ## Install
 
-**Scoop / manual** — drop the binary anywhere on `PATH`:
+**Scoop**
 
 ```powershell
-Invoke-WebRequest https://github.com/<you>/sshpass-win/releases/latest/download/sshpass.exe -OutFile "$env:USERPROFILE\.local\bin\sshpass.exe"
+scoop bucket add zsyn666 https://github.com/zsyn666/sshpass-win
+scoop install sshpass-win
+```
+
+**WinGet** (after the manifest PR is merged)
+
+```powershell
+winget install zsyn666.sshpass-win
+```
+
+**Installer** — downloads `sshpass-win-<version>-x64-setup.exe` from the
+[releases page](https://github.com/zsyn666/sshpass-win/releases). It installs
+per-user under `%LOCALAPPDATA%\Programs\sshpass-win` and adds that directory to
+your user `PATH`; the uninstaller removes it again.
+
+**Portable** — drop `sshpass.exe` anywhere on `PATH`:
+
+```powershell
+Invoke-WebRequest https://github.com/zsyn666/sshpass-win/releases/latest/download/sshpass.exe -OutFile "$env:USERPROFILE\.local\bin\sshpass.exe"
 ```
 
 **From source** (needs Rust):
 
 ```powershell
-cargo install --git https://github.com/<you>/sshpass-win --bin sshpass
+cargo install --git https://github.com/zsyn666/sshpass-win --bin sshpass
 ```
 
 Requires Windows 10 1809+ (for ConPTY) and Windows OpenSSH 8.4+ (for `SSH_ASKPASS_REQUIRE`). Both ship with Windows by default.
@@ -127,6 +145,18 @@ Known, deliberate differences:
 - The `askpass` engine never sees a host-key prompt because ssh auto-accepts unknown keys without a terminal. Use `SSHPASS_RS_ENGINE=pty` when you need sshpass's exact host-key refusal behaviour.
 - The `pty` engine merges stdout and stderr because ConPTY attaches both to the console. The `askpass` engine keeps them separate; prefer it for scripts that redirect stderr.
 
+## Releasing
+
+Push a tag such as `v1.0.0`. `.github/workflows/release.yml` runs the format and
+test gates, builds `sshpass.exe`, the portable zip and the Inno Setup installer,
+publishes them with SHA-256 checksums, then updates the Scoop and WinGet
+manifests in `main`.
+
+The WinGet listing is a pull request against `microsoft/winget-pkgs`. Add a
+classic PAT with `public_repo` as the `WINGET_TOKEN` repository secret, then run
+the **Submit to WinGet** workflow with the released version. After the PR is
+merged, `winget install zsyn666.sshpass-win` works.
+
 ## Security
 
 - **`-p` puts the password in the process list.** Same as `sshpass`. Prefer `-e`, `-f`, or stdin.
@@ -137,7 +167,7 @@ Known, deliberate differences:
 ## Building from source
 
 ```powershell
-git clone https://github.com/<you>/sshpass-win
+git clone https://github.com/zsyn666/sshpass-win
 cd sshpass-win
 cargo build --release --bin sshpass
 # target\release\sshpass.exe
