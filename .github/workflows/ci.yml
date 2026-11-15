@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin sshpass
+
+      - name: Unit and CLI tests
+        run: cargo test --lib --bins --test cli -- --test-threads=1
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshpass-windows-x86_64
+          path: target/release/sshpass.exe
