@@ -1,5 +1,13 @@
+# Rust build output and local caches — never part of the repository.
 /target/
 /.cargo-home/
 /.build-tmp/
 /dist/
+
+# Local release artifacts.
+/*.exe
+/*.zip
 *.pdb
+
+# Keep .cargo/config.toml and .github/workflows tracked: they are project
+# configuration, not build output.
