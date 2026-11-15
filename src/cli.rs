@@ -36,14 +36,17 @@ Usage: sshpass [-f|-d|-p|-e[env_var]] [-hV] command parameters
    -V            Print version information.
 At most one of -f, -d, -p or -e should be used.";
 
-pub const VERSION_TEXT: &str = "\
-sshpass 1.0.0 (sshpass-win, Rust)
-(C) 2026 sshpass-win contributors
-Compatible with sshpass 1.10 by Lingnu Open Source Consulting Ltd. and Shachar Shemesh
-This program is free software, and can be distributed under the terms of the MIT license
-See the LICENSE file for more information.
-
-Using \"assword\" as the default password prompt indicator.";
+pub const VERSION_TEXT: &str = concat!(
+    "sshpass ",
+    env!("CARGO_PKG_VERSION"),
+    " (sshpass-win, Rust)\n",
+    "(C) 2026 zsyn666\n",
+    "Compatible with sshpass 1.10 by Lingnu Open Source Consulting Ltd. and Shachar Shemesh\n",
+    "This program is free software, and can be distributed under the terms of the MIT license\n",
+    "See the LICENSE file for more information.\n",
+    "\n",
+    "Using \"assword\" as the default password prompt indicator."
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordSource {

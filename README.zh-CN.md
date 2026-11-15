@@ -40,6 +40,8 @@ winget install zsyn666.sshpass-win
 **安装器** — 从 [Releases](https://github.com/zsyn666/sshpass-win/releases) 下载
 `sshpass-win-<version>-x64-setup.exe`。按用户安装到
 `%LOCALAPPDATA%\Programs\sshpass-win`，并把该目录加入用户 `PATH`；卸载时自动移除。
+安装向导支持 English、简体中文、繁體中文、日本語、Deutsch、Français、Español、Русский，
+并按 Windows 界面语言自动选择。
 
 **便携版** — 把 `sshpass.exe` 放到 `PATH` 上任意目录：
 

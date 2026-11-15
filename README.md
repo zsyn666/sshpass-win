@@ -45,7 +45,9 @@ winget install zsyn666.sshpass-win
 **Installer** — downloads `sshpass-win-<version>-x64-setup.exe` from the
 [releases page](https://github.com/zsyn666/sshpass-win/releases). It installs
 per-user under `%LOCALAPPDATA%\Programs\sshpass-win` and adds that directory to
-your user `PATH`; the uninstaller removes it again.
+your user `PATH`; the uninstaller removes it again. The wizard is localized in
+English, 简体中文, 繁體中文, 日本語, Deutsch, Français, Español and Русский, and
+picks the Windows UI language automatically.
 
 **Portable** — drop `sshpass.exe` anywhere on `PATH`:
 

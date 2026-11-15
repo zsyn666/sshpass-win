@@ -92,7 +92,10 @@ fn help_and_version_match_sshpass_shape() {
     );
     assert!(version.status.success());
     let body = text(&version);
-    assert!(body.contains("sshpass 1.0.0"), "{body}");
+    assert!(
+        body.contains(&format!("sshpass {}", env!("CARGO_PKG_VERSION"))),
+        "{body}"
+    );
     assert!(body.contains("Using \"assword\" as the default password prompt indicator."));
 }
 
