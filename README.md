@@ -4,11 +4,11 @@
 
 **A drop-in `sshpass` for Windows.**
 
-Password authentication for `ssh`, `scp` and `sftp` — native, no MSYS, no Cygwin, no pty.
+Password authentication for `ssh`, `scp` and `sftp` — native, no MSYS, no Cygwin, no pty required.
 
 [![Platform](https://img.shields.io/badge/platform-windows-0078D6?logo=windows&logoColor=white)](#compatibility)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-CE422B?logo=rust&logoColor=white)](#building-from-source)
-[![Tests](https://img.shields.io/badge/tests-68%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-78%20passing-2ea44f)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -25,7 +25,7 @@ Password authentication for `ssh`, `scp` and `sftp` — native, no MSYS, no Cygw
 - Inside restricted environments (job objects, sandboxes, service accounts) the Cygwin runtime often cannot even start: `fatal error - couldn't create signal pipe, Win32 error 5`.
 - Path and environment mangling between PowerShell → MSYS → `ssh` breaks `known_hosts` and key lookup.
 
-`sshpass-win` is a single native executable. It uses OpenSSH's own `SSH_ASKPASS` hook to hand over the password, so `ssh` asks *us* instead of a terminal. No pty, no shell shims, no runtime DLLs.
+`sshpass-win` is a single native executable. For OpenSSH it uses the client's own `SSH_ASKPASS` hook, so `ssh` asks *us* for the password instead of a terminal. No pty, no shell shims, no runtime DLLs. For programs that genuinely need a console (`sftp`, anything else), it falls back to a native ConPTY loop that reproduces sshpass's original pty behaviour and exit codes.
 
 ## Install
 
@@ -54,58 +54,85 @@ $ sshpass -f ~/.pw sftp -b - root@10.0.0.1 < commands.txt
 ```
 
 ```
-Usage: sshpass [-f|-d|-p|-e] [-hV] command parameters
-  -f filename   Take password to use from file
-  -d number     Use number as file descriptor for getting password (Windows: 0 only)
-  -p password   Provide password as argument (security unwise)
-  -e            Password is passed as env-var "SSHPASS"
-  -P prompt     Which string should sshpass search for to detect a password prompt
-  -v            Be verbose about what you're doing
-  -h, --help    Show help
-  -V, --version Show version
-With no password option, the first line of stdin is used.
+Usage: sshpass [-f|-d|-p|-e[env_var]] [-hV] command parameters
+   -f filename   Take password to use from file.
+   -d number     Use number as file descriptor for getting password.
+   -p password   Provide password as argument (security unwise).
+   -e[env_var]   Password is passed as env-var "env_var" if given, "SSHPASS" otherwise.
+   With no parameters - password will be taken from stdin.
+
+   -P prompt     Which string should sshpass search for to detect a password prompt.
+   -v            Be verbose about what you're doing.
+   -h            Show help (this screen).
+   -V            Print version information.
+At most one of -f, -d, -p or -e should be used.
 ```
 
 Anything after the options is executed verbatim, so `ssh` keeps its own flags, config, `ProxyJump`, multiplexing and agent behaviour.
 
 | Behaviour | Detail |
 |---|---|
-| Exit code | The child's exit code. Usage errors exit `1`; auth failures are whatever `ssh` returns (`255`). |
+| Exit codes | `0` success · `1` invalid arguments · `2` conflicting password source · `3` runtime error · `5` incorrect password · `6` unknown host key · otherwise the child's code (`255` for ssh auth failures). |
 | stdin | Forwarded to the child. With no `-p/-e/-f/-d`, the **first line is the password** and the rest is forwarded. |
-| stdout / stderr | Inherited untouched — pipes, redirection and `-t` all behave normally. |
-| `-P` | Narrows prompt detection to your string (useful for non-English or non-standard prompts). |
-| `-v` | Prints the resolved program, engine and password source. **Never** the password. |
+| stdout / stderr | Inherited untouched on the askpass path — pipes, redirection and `-t` behave normally. |
+| `-P` | Replaces the default prompt marker (`assword`), exactly like sshpass. |
+| `-v` | Prints the same `SSHPASS: ...` diagnostics as sshpass, never the password. |
+| `-e` | A bare `-e` reads `SSHPASS`; `-eMYVAR` reads `MYVAR`. The space form (`-e MYVAR`) treats `MYVAR` as the command, as in sshpass 1.10. |
 
 ## How it works
 
 Two engines, picked automatically:
 
-**`askpass` — the default for `ssh` and `scp`.** OpenSSH 8.4+ honours `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force`, calling a helper program instead of prompting on a terminal. `sshpass-win` launches `ssh` with itself as that helper, passing the secret through the child's environment. `ssh` invokes `sshpass.exe "root@host's password: "`, we print the password on stdout, and authentication proceeds exactly as it would interactively.
+**`askpass` — default for `ssh` and `scp`.** OpenSSH 8.4+ honours `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force`, calling a helper program instead of prompting on a terminal. `sshpass-win` launches `ssh` with itself as that helper, passing the secret through the child's environment. `ssh` invokes `sshpass.exe "root@host's password: "`, we print the password on stdout, and authentication proceeds exactly as it would interactively. stdout and stderr stay separate, and no terminal is allocated.
 
-**`pty` — the fallback for `sftp` and any other console program.** A ConPTY is allocated, output is relayed, and a rolling scanner watches for a password prompt. This is the same model as original `sshpass`, and it is what `sftp` needs: it refuses to call the askpass helper when its stdin is not a terminal.
+**`pty` — `sftp`, `ssh -t`/`-tt`, and any other console program.** A ConPTY is allocated, output is relayed, and a rolling scanner watches for the prompt. This is sshpass's original model, including its error policy: a repeated prompt means wrong password (exit `5`), and `The authenticity of host` means unknown host key (exit `6`). It is what `sftp` needs: it refuses to call the askpass helper when its stdin is not a terminal.
 
-Force either one with `SSHPASS_RS_ENGINE=askpass|pty`.
+Force either one with `SSHPASS_RS_ENGINE=askpass|pty`. `SSHPASS_RS_ENGINE=pty` gives byte-for-byte original `sshpass` prompt handling for every command.
 
-Either way the password never appears on a command line, and after it is typed it is redacted from the relayed output.
+## Compatibility with sshpass 1.10
+
+Tested side by side against a locally built `sshpass 1.10` on Linux:
+
+| Invocation | sshpass 1.10 | sshpass-win |
+|---|---|---|
+| `sshpass -h` | usage text | **identical** |
+| `sshpass` / `sshpass -p x` | usage, exit `0` | same |
+| `sshpass -V` | version + default prompt, exit `0` | same shape, branded version, exit `0` |
+| `sshpass -p a -p b ssh` | `Conflicting password source`, exit `2` | same |
+| `sshpass -f a -d 0 ssh` | `Conflicting password source`, exit `2` | same |
+| `sshpass -q ssh` | `invalid option -- 'q'`, exit `1` | same |
+| `sshpass -d` | `option requires an argument -- 'd'`, exit `1` | same |
+| `sshpass --help` | `invalid option -- '-'`, exit `1` | same |
+| `sshpass -e ssh` (unset) | message, exit `1` (1.10 crashes here) | message, exit `1` |
+| `sshpass -eMYVAR ssh` (unset) | message naming `MYVAR`, exit `1` | same |
+| `sshpass -d abc ssh -V` | `atoi` → stdin, exit `0` | same |
+| `sshpass -d -1 ssh -V` | exit `0` when no prompt occurs | same |
+| `sshpass -p x -- -missing` | `Failed to run command`, exit `3` | same |
+| `sshpass -p a -e ssh` (env set) | conflict, exit `2` | same |
+| `sshpass -P one -P two -p x ssh -V` | last `-P` wins, exit `0` | same |
+| `sshpass -vv -p x ssh -V` | verbose, exit `0` | same |
+| options after the command | passed to ssh | same |
+| correct password | exit `0` | exit `0` |
+| wrong password, default prompt count | exit `5` | exit `5` |
+| wrong password, `NumberOfPasswordPrompts=1` | exit `255` | exit `255` |
+| unknown host key (pty) | exit `6` | exit `6` |
+| changed host key | ssh's `255` | ssh's `255` |
+| missing command | `Failed to run command`, exit `3` | same |
+
+Known, deliberate differences:
+
+- `-V` prints the sshpass-win version and MIT licence instead of the original GPL notice.
+- sshpass 1.10 segfaults on `-e` with an unset variable; we print the error and exit `1`.
+- Windows has no POSIX file descriptors. `-d 0` is stdin; any other value behaves like an unreadable descriptor and sends an empty password, exactly as sshpass does when `read()` fails.
+- The `askpass` engine never sees a host-key prompt because ssh auto-accepts unknown keys without a terminal. Use `SSHPASS_RS_ENGINE=pty` when you need sshpass's exact host-key refusal behaviour.
+- The `pty` engine merges stdout and stderr because ConPTY attaches both to the console. The `askpass` engine keeps them separate; prefer it for scripts that redirect stderr.
 
 ## Security
 
 - **`-p` puts the password in the process list.** Same as `sshpass`. Prefer `-e`, `-f`, or stdin.
 - The password is passed to the child in an environment variable, which is visible to processes that can already inspect your process. `sshpass`'s pty approach has the same exposure.
-- The secret is zeroed on drop, redacted from relayed output, and never logged — including under `-v`.
+- The secret is zeroed on drop, redacted from terminal echo, and never logged — including under `-v`.
 - Host-key confirmation prompts are **refused**, not answered with the password. Pre-add the key, or pass `-o StrictHostKeyChecking=accept-new`.
-
-## Compatibility
-
-| | |
-|---|---|
-| Windows | 10 1809+ / 11 / Server 2019+ (x86-64) |
-| OpenSSH | 8.4+ (`C:\Windows\System32\OpenSSH\`) |
-| Commands | `ssh`, `scp`, `sftp`, any console program |
-| MSYS2 / Cygwin | Not required, and deliberately avoided |
-| Dependencies | None beyond the Windows UCRT |
-
-`scp` needs `-O` when the server has no SFTP subsystem (common on routers and busybox/dropbear targets).
 
 ## Building from source
 
@@ -116,13 +143,13 @@ cargo build --release --bin sshpass
 # target\release\sshpass.exe
 ```
 
-Static CRT is enabled in `.cargo/config.toml`, so the result is a single ~460 KB executable with no redistributables.
+Static CRT is enabled in `.cargo/config.toml`, so the result is a single ~470 KB executable with no redistributables.
 
 ## Testing
 
 ```console
-$ cargo test                      # 40 unit + 19 CLI tests
-$ cargo test --test ssh_integration   # 9 live tests, opt-in
+$ cargo test --features test-helpers                  # 40 unit + 25 CLI tests
+$ cargo test --features test-helpers --test ssh_integration   # 13 live tests
 ```
 
 Live tests hit a real server and are skipped unless configured:
@@ -130,17 +157,17 @@ Live tests hit a real server and are skipped unless configured:
 ```powershell
 $env:SSHPASS_TEST_HOST='10.0.0.1'; $env:SSHPASS_TEST_USER='root'
 $env:SSHPASS_TEST_PASSWORD='...'
-cargo test --test ssh_integration -- --test-threads=1
+cargo test --features test-helpers --test ssh_integration -- --test-threads=1
 ```
 
-They cover askpass and pty engines, all four password sources, exit-code propagation, stdin payloads, UTF-8 and large output, wrong-password fast-failure, and `scp`.
+They cover both engines, all four password sources, exit codes `0/3/5/6/7/255`, `-t`/`-tt`, host-key prompts, wrong-password fast-failure, stdin payloads, UTF-8, large output, and `scp`.
 
 ## Limitations
 
-- `-d` accepts only `0` (stdin). Windows has no portable "read from fd N".
+- `-d` accepts only `0` (stdin) in practice; Windows has no POSIX file-descriptor table.
 - Passwords are UTF-8; non-UTF-8 byte sequences are not representable.
 - The pty engine translates a bare `LF` on stdin to `CRLF`, because a console child only submits a line on CR.
-- No `-P` prompt rewriting: the flag only selects which prompt to answer.
+- `-P` selects which prompt to answer; it does not rewrite the prompt text.
 
 ## License
 

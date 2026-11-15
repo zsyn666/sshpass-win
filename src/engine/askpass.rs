@@ -1,21 +1,25 @@
 //! OpenSSH `SSH_ASKPASS` engine.
 //!
-//! Instead of driving a pty, this engine lets OpenSSH ask *us* for the
-//! password.  It is the most reliable path on Windows and works under the
-//! DSH file sandbox because no Cygwin/MSYS runtime and no named signal pipe
-//! are involved.
+//! OpenSSH can delegate password prompts to a helper program. This engine
+//! points `SSH_ASKPASS` at this executable, so ssh asks us for the password
+//! instead of a terminal. It keeps stdout/stderr separate and works without a
+//! pseudo console.
 
 use crate::cli::Cli;
-use crate::prompt::{is_host_key_prompt, prompt_matches};
+use crate::prompt::{is_host_key_question, prompt_matches};
 use crate::secret::Secret;
 use std::ffi::OsString;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 pub const HELPER_ENV: &str = "SSHPASS_RS_ASKPASS";
 pub const PASSWORD_ENV: &str = "SSHPASS_RS_PASSWORD";
 pub const PROMPT_ENV: &str = "SSHPASS_RS_PROMPT";
+pub const COUNT_ENV: &str = "SSHPASS_RS_PROMPT_COUNT";
+pub const VERBOSE_ENV: &str = "SSHPASS_RS_VERBOSE";
 
 pub fn is_helper_invocation() -> bool {
     std::env::var_os(HELPER_ENV).is_some_and(|value| value == "1")
@@ -23,34 +27,57 @@ pub fn is_helper_invocation() -> bool {
 
 /// Called when ssh invokes this executable as its askpass helper.
 pub fn helper() -> ! {
+    let verbose = std::env::var_os(VERBOSE_ENV).is_some();
+    let mut previous = 0u64;
+    if let Some(path) = std::env::var_os(COUNT_ENV) {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            previous = metadata.len();
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(b"1");
+        }
+    }
+
     let prompt = std::env::args_os()
         .nth(1)
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    if is_host_key_prompt(&prompt) {
+    if is_host_key_question(&prompt) {
         eprintln!(
-            "sshpass: refusing to answer a host-key confirmation prompt with a password: {prompt}"
+            "SSHPASS: refusing to answer a host-key confirmation prompt with a password: {prompt}"
         );
-        eprintln!("sshpass: pre-add the host key or pass -o StrictHostKeyChecking=accept-new");
+        eprintln!("SSHPASS: pre-add the host key or pass -o StrictHostKeyChecking=accept-new");
         std::process::exit(1);
     }
 
-    let custom = std::env::var(PROMPT_ENV).ok();
-    if let Some(custom) = custom.as_deref() {
-        if !prompt.contains(custom) {
-            eprintln!("sshpass: prompt does not contain the -P value {custom:?}");
-            std::process::exit(1);
+    let custom = std::env::var(PROMPT_ENV).unwrap_or_else(|_| crate::prompt::DEFAULT_PROMPT.into());
+    if !prompt_matches(&prompt, &custom) {
+        eprintln!("SSHPASS: prompt does not contain the -P value {custom:?}");
+        std::process::exit(1);
+    }
+
+    if verbose {
+        eprintln!("SSHPASS: read: {prompt}");
+        if previous == 0 {
+            eprintln!("SSHPASS: detected prompt. Sending password.");
+        } else {
+            eprintln!("SSHPASS: detected prompt, again. Wrong password. Terminating.");
         }
-    } else if !prompt_matches(&prompt, None) {
-        eprintln!("sshpass: unrecognized password prompt: {prompt}");
+    }
+    if previous > 0 {
+        // sshpass terminates on the second prompt instead of trying again.
         std::process::exit(1);
     }
 
     let password = match std::env::var(PASSWORD_ENV) {
         Ok(value) => value,
         Err(_) => {
-            eprintln!("sshpass: internal askpass invocation without a password");
+            eprintln!("SSHPASS: internal askpass invocation without a password");
             std::process::exit(1);
         }
     };
@@ -62,95 +89,36 @@ pub fn helper() -> ! {
     std::process::exit(0);
 }
 
-/// Find the ssh binary that belongs to `program` (same directory for
-/// scp/sftp, otherwise `ssh` from PATH).
-pub fn find_ssh(program: &Path) -> Option<PathBuf> {
-    let stem = program
-        .file_stem()
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if stem == "ssh" {
-        return Some(program.to_path_buf());
-    }
-    if let Some(dir) = program.parent() {
-        let candidate = dir.join("ssh.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    crate::which::resolve(std::ffi::OsStr::new("ssh"))
-        .ok()
-        .map(|info| info.path)
-}
-
-/// Parse `OpenSSH_for_Windows_9.5p2` / `OpenSSH_9.5p2`.
-pub fn parse_openssh_version(text: &str) -> Option<(u32, u32)> {
-    let start = text.find("OpenSSH")? + "OpenSSH".len();
-    let bytes = text.as_bytes();
-    let mut i = start;
-    while i < bytes.len() && !bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    let major_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == major_start {
-        return None;
-    }
-    let major: u32 = text[major_start..i].parse().ok()?;
-    if i >= bytes.len() || bytes[i] != b'.' {
-        return Some((major, 0));
-    }
-    i += 1;
-    let minor_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == minor_start {
-        return Some((major, 0));
-    }
-    let minor: u32 = text[minor_start..i].parse().ok()?;
-    Some((major, minor))
-}
-
-pub fn ssh_version(ssh: &Path) -> Option<(u32, u32)> {
-    let output = Command::new(ssh)
-        .arg("-V")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    parse_openssh_version(&text)
-}
-
-/// `SSH_ASKPASS_REQUIRE=force` was added in OpenSSH 8.4.
-pub fn supports_askpass(ssh: &Path) -> bool {
-    matches!(ssh_version(ssh), Some((major, minor)) if (major, minor) >= (8, 4))
-}
-
 fn askpass_path() -> Result<OsString, String> {
     let exe = std::env::current_exe()
         .map_err(|err| format!("cannot determine the current executable: {err}"))?;
-    // CreateProcess accepts verbatim paths, but ssh's own path handling is
-    // happier without the \\?\ prefix.
     let text = exe.to_string_lossy();
     let cleaned = text.strip_prefix(r"\\?\").unwrap_or(&text);
     Ok(OsString::from(cleaned))
 }
 
-pub fn run(
-    cli: &Cli,
-    program: &Path,
-    password: &Secret,
-    verbose: bool,
-) -> Result<i32, String> {
+fn count_path() -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "sshpass-win-{}-{}.count",
+        std::process::id(),
+        stamp
+    ))
+}
+
+pub fn run(cli: &Cli, program: &Path, password: &Secret, verbose: bool) -> Result<i32, String> {
     let askpass = askpass_path()?;
+    let counts = count_path();
+    let _ = std::fs::remove_file(&counts);
 
     if verbose {
-        eprintln!("sshpass: engine: askpass");
-        eprintln!("sshpass: askpass helper: {}", askpass.to_string_lossy());
+        eprintln!(
+            "SSHPASS: searching for password prompt using match \"{}\"",
+            cli.prompt
+        );
     }
 
     let mut command = Command::new(program);
@@ -159,21 +127,70 @@ pub fn run(
     command.env("SSH_ASKPASS_REQUIRE", "force");
     command.env(HELPER_ENV, "1");
     command.env(PASSWORD_ENV, password.expose());
-    if let Some(prompt) = cli.prompt.as_deref() {
-        command.env(PROMPT_ENV, prompt);
+    command.env(PROMPT_ENV, &cli.prompt);
+    command.env(COUNT_ENV, &counts);
+    if verbose {
+        command.env(VERBOSE_ENV, "1");
+    }
+    command.stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("SSHPASS: Failed to run command: {err}"))?;
+
+    // Relay ssh's stderr while watching for the host-key message. ssh writes
+    // that prompt to stderr, not to a tty, when it has no terminal.
+    let mut stderr = child.stderr.take();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<bool>();
+    if let Some(mut stream) = stderr.take() {
+        thread::spawn(move || {
+            let mut tail = String::new();
+            let mut buffer = [0u8; 4096];
+            let mut host_key_unknown = false;
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = std::io::stderr().write_all(&buffer[..count]);
+                        let _ = std::io::stderr().flush();
+                        tail.push_str(&String::from_utf8_lossy(&buffer[..count]));
+                        if crate::prompt::is_host_key_prompt(&tail) {
+                            host_key_unknown = true;
+                        }
+                        if tail.len() > 8192 {
+                            tail.drain(..tail.len() - 8192);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stderr_tx.send(host_key_unknown);
+        });
+    } else {
+        let _ = stderr_tx.send(false);
     }
 
-    let status = command
-        .status()
-        .map_err(|err| format!("cannot start {}: {err}", program.display()))?;
+    let status = child
+        .wait()
+        .map_err(|err| format!("SSHPASS: error while waiting for the child: {err}"))?;
+    let host_key_unknown = stderr_rx.recv().unwrap_or(false);
 
-    if verbose {
-        match status.code() {
-            Some(code) => eprintln!("sshpass: child exited with status {code}"),
-            None => eprintln!("sshpass: child terminated without an exit code"),
+    let prompt_count = std::fs::read_to_string(&counts)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    let _ = std::fs::remove_file(&counts);
+
+    let mut code = status.code().unwrap_or(1);
+    if code != 0 {
+        if host_key_unknown {
+            code = crate::exit::HOST_KEY_UNKNOWN;
+        } else if prompt_count >= 2 {
+            // sshpass treats a repeated password prompt as a wrong password.
+            code = crate::exit::INCORRECT_PASSWORD;
         }
     }
-    Ok(status.code().unwrap_or(1))
+
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -181,26 +198,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_windows_version() {
-        assert_eq!(
-            parse_openssh_version("OpenSSH_for_Windows_9.5p2, LibreSSL 3.8.2"),
-            Some((9, 5))
-        );
-        assert_eq!(parse_openssh_version("OpenSSH_8.4p1 Debian"), Some((8, 4)));
-        assert_eq!(parse_openssh_version("OpenSSH_9.5"), Some((9, 5)));
-        assert_eq!(parse_openssh_version("something else"), None);
-    }
-
-    #[test]
-    fn version_ordering() {
-        assert!((8, 4) >= (8, 4));
-        assert!((10, 0) > (9, 9));
-    }
-
-    #[test]
-    fn real_ssh_version_is_recent() {
-        if let Some((major, minor)) = ssh_version(Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe")) {
-            assert!((major, minor) >= (8, 4), "unexpected version {major}.{minor}");
-        }
+    fn prompt_matching_uses_default_marker() {
+        assert!(prompt_matches("root@host's password: ", "assword"));
+        assert!(!prompt_matches("Verification code: ", "assword"));
     }
 }

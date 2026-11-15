@@ -23,7 +23,7 @@ pub fn resolve(program: &OsStr) -> Result<ProgramInfo, String> {
     let path = if raw.contains('\\') || raw.contains('/') || Path::new(program).is_absolute() {
         let path = PathBuf::from(program);
         if !path.is_file() {
-            return Err(format!("cannot find program: {}", path.display()));
+            return Err("No such file or directory".to_string());
         }
         path
     } else {
@@ -48,18 +48,15 @@ pub fn resolve(program: &OsStr) -> Result<ProgramInfo, String> {
 
 fn find_in_path(program: &OsStr) -> Result<PathBuf, String> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    let mut attempts: Vec<PathBuf> = Vec::new();
 
     for dir in std::env::split_paths(&path_var) {
         let direct = dir.join(program);
-        attempts.push(direct.clone());
         if direct.is_file() {
             return Ok(direct);
         }
 
         if Path::new(program).extension().is_none() {
             let with_exe = direct.with_extension("exe");
-            attempts.push(with_exe.clone());
             if with_exe.is_file() {
                 return Ok(with_exe);
             }
@@ -70,17 +67,7 @@ fn find_in_path(program: &OsStr) -> Result<PathBuf, String> {
         }
     }
 
-    let preview = attempts
-        .iter()
-        .take(5)
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "cannot find program {:?} in PATH (looked for: {preview}{})",
-        program,
-        if attempts.len() > 5 { ", ..." } else { "" }
-    ))
+    Err("No such file or directory".to_string())
 }
 
 #[cfg(test)]
@@ -109,12 +96,12 @@ mod tests {
     #[test]
     fn missing_program_is_an_error() {
         let err = resolve(OsStr::new("definitely-not-a-real-program-xyz")).unwrap_err();
-        assert!(err.contains("cannot find program"), "{err}");
+        assert!(err.contains("No such file or directory"), "{err}");
     }
 
     #[test]
     fn absolute_missing_program_is_an_error() {
         let err = resolve(OsStr::new(r"C:\definitely\missing\sshpass-nope.exe")).unwrap_err();
-        assert!(err.contains("cannot find program"), "{err}");
+        assert!(err.contains("No such file or directory"), "{err}");
     }
 }

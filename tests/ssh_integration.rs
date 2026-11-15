@@ -1,13 +1,10 @@
 //! Live tests against a real OpenSSH server.
 //!
-//! These are skipped unless the environment provides:
+//! Skipped unless the environment provides:
 //!   SSHPASS_TEST_HOST, SSHPASS_TEST_USER, SSHPASS_TEST_PASSWORD
 //!
-//! Run them with:
-//!   $env:SSHPASS_TEST_HOST='192.168.1.6'
-//!   $env:SSHPASS_TEST_USER='root'
-//!   $env:SSHPASS_TEST_PASSWORD='...'
-//!   cargo test --test ssh_integration -- --test-threads=1
+//! Run with:
+//!   cargo test --features test-helpers --test ssh_integration -- --test-threads=1
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -26,7 +23,11 @@ fn target() -> Option<Target> {
     let host = std::env::var("SSHPASS_TEST_HOST").ok()?;
     let user = std::env::var("SSHPASS_TEST_USER").ok()?;
     let password = std::env::var("SSHPASS_TEST_PASSWORD").ok()?;
-    Some(Target { host, user, password })
+    Some(Target {
+        host,
+        user,
+        password,
+    })
 }
 
 fn destination(target: &Target) -> String {
@@ -40,6 +41,7 @@ fn base() -> Command {
         "SSHPASS_RS_ASKPASS",
         "SSHPASS_RS_PASSWORD",
         "SSHPASS_RS_PROMPT",
+        "SSHPASS_RS_PROMPT_COUNT",
         "SSHPASS",
     ] {
         cmd.env_remove(key);
@@ -69,12 +71,24 @@ fn err(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn ssh_options() -> Vec<&'static str> {
+fn temp_known_hosts(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "sshpass-win-{}-{}-{}",
+        std::process::id(),
+        name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+fn ssh_options() -> Vec<String> {
     vec![
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        "NumberOfPasswordPrompts=1",
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "NumberOfPasswordPrompts=3".into(),
     ]
 }
 
@@ -119,7 +133,11 @@ fn askpass_stdin_payload() {
     let input = format!("{}\npayload-from-stdin\n", target.password);
     let output = run(cmd, Some(input.as_bytes()));
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert!(out(&output).contains("payload-from-stdin"), "{}", out(&output));
+    assert!(
+        out(&output).contains("payload-from-stdin"),
+        "{}",
+        out(&output)
+    );
 }
 
 #[test]
@@ -137,7 +155,7 @@ fn password_sources_against_ssh() {
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
     assert!(out(&output).contains("ENV_OK"));
 
-    let path = std::env::temp_dir().join(format!("sshpass-rs-live-{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sshpass-win-live-{}.txt", std::process::id()));
     std::fs::write(&path, format!("{}\n", target.password)).unwrap();
     let mut file_cmd = base();
     file_cmd.arg("-f").arg(&path).arg("ssh");
@@ -170,13 +188,18 @@ fn password_sources_against_ssh() {
 }
 
 #[test]
-fn wrong_password_fails_fast() {
+fn wrong_password_one_prompt_returns_255() {
     let Some(target) = target() else { return };
     let _guard = LOCK.lock().unwrap();
     let started = std::time::Instant::now();
     let mut cmd = base();
     cmd.args(["-p", "definitely-wrong-password", "ssh"]);
-    cmd.args(ssh_options());
+    cmd.args([
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+    ]);
     cmd.arg(destination(&target));
     cmd.arg("true");
     let output = run(cmd, None);
@@ -187,6 +210,19 @@ fn wrong_password_fails_fast() {
         "took {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn wrong_password_repeated_prompt_returns_5() {
+    let Some(target) = target() else { return };
+    let _guard = LOCK.lock().unwrap();
+    let mut cmd = base();
+    cmd.args(["-p", "definitely-wrong-password", "ssh"]);
+    cmd.args(ssh_options());
+    cmd.arg(destination(&target));
+    cmd.arg("true");
+    let output = run(cmd, None);
+    assert_eq!(output.status.code(), Some(5), "{}", err(&output));
 }
 
 #[test]
@@ -202,6 +238,56 @@ fn forced_pty_engine_works_with_ssh() {
     let output = run(cmd, None);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
     assert!(out(&output).contains("PTY_OK"), "{}", out(&output));
+}
+
+#[test]
+fn forced_pty_wrong_password_returns_5() {
+    let Some(target) = target() else { return };
+    let _guard = LOCK.lock().unwrap();
+    let mut cmd = base();
+    cmd.env("SSHPASS_RS_ENGINE", "pty");
+    cmd.args(["-p", "definitely-wrong-password", "ssh"]);
+    cmd.args(ssh_options());
+    cmd.arg(destination(&target));
+    cmd.arg("true");
+    let output = run(cmd, None);
+    assert_eq!(output.status.code(), Some(5), "{}", err(&output));
+}
+
+#[test]
+fn pty_host_key_unknown_returns_6() {
+    let Some(target) = target() else { return };
+    let _guard = LOCK.lock().unwrap();
+    let known_hosts = temp_known_hosts("unknown");
+    let mut cmd = base();
+    cmd.env("SSHPASS_RS_ENGINE", "pty");
+    cmd.args(["-p", &target.password, "ssh"]);
+    cmd.arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    cmd.args(["-o", "StrictHostKeyChecking=ask"]);
+    cmd.arg(destination(&target));
+    cmd.arg("true");
+    let output = run(cmd, None);
+    let _ = std::fs::remove_file(&known_hosts);
+    assert_eq!(output.status.code(), Some(6), "{}", err(&output));
+}
+
+#[test]
+fn tty_flag_uses_the_pty_engine() {
+    let Some(target) = target() else { return };
+    let _guard = LOCK.lock().unwrap();
+    let known_hosts = temp_known_hosts("tty");
+    let mut cmd = base();
+    cmd.args(["-p", &target.password, "ssh", "-tt"]);
+    cmd.arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    cmd.args(["-o", "StrictHostKeyChecking=accept-new"]);
+    cmd.arg(destination(&target));
+    cmd.arg("echo TTY_OK");
+    let output = run(cmd, None);
+    let _ = std::fs::remove_file(&known_hosts);
+    assert_eq!(output.status.code(), Some(0), "{}", err(&output));
+    assert!(out(&output).contains("TTY_OK"), "{}", out(&output));
 }
 
 #[test]
@@ -230,7 +316,10 @@ fn large_remote_output() {
     let output = run(cmd, None);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
     let body = out(&output);
-    assert!(body.contains("LINE1\r\n") || body.contains("LINE1\n"), "{body}");
+    assert!(
+        body.contains("LINE1\r\n") || body.contains("LINE1\n"),
+        "{body}"
+    );
     assert!(body.contains("LINE200"), "{body}");
 }
 
@@ -238,9 +327,9 @@ fn large_remote_output() {
 fn scp_legacy_protocol() {
     let Some(target) = target() else { return };
     let _guard = LOCK.lock().unwrap();
-    let local = std::env::temp_dir().join(format!("sshpass-rs-scp-{}.txt", std::process::id()));
+    let local = std::env::temp_dir().join(format!("sshpass-win-scp-{}.txt", std::process::id()));
     std::fs::write(&local, b"scp-payload-123").unwrap();
-    let remote = format!("/tmp/sshpass-rs-scp-{}.txt", std::process::id());
+    let remote = format!("/tmp/sshpass-win-scp-{}.txt", std::process::id());
 
     let mut upload = base();
     upload.args(["-p", &target.password, "scp", "-O"]);

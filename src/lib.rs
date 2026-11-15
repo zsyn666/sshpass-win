@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod engine;
+pub mod exit;
 pub mod password;
 pub mod prompt;
 pub mod secret;

@@ -1,5 +1,6 @@
-use sshpass_win::cli::{self, ParseOutcome};
+use sshpass_win::cli::{self, Outcome, ParseError};
 use sshpass_win::engine;
+use sshpass_win::exit;
 use sshpass_win::password;
 use sshpass_win::which;
 use std::process::ExitCode;
@@ -12,48 +13,78 @@ fn main() -> ExitCode {
 
     match run() {
         Ok(code) => ExitCode::from(normalize_exit_code(code)),
-        Err(message) => {
-            eprintln!("sshpass: {message}");
-            ExitCode::from(1)
-        }
+        Err(code) => ExitCode::from(code.clamp(0, 255) as u8),
     }
 }
 
-fn run() -> Result<i32, String> {
+fn run() -> Result<i32, i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let cli = match cli::parse(args)? {
-        ParseOutcome::Help => {
-            cli::print_help();
-            return Ok(0);
+    let cli = match cli::parse(args) {
+        Ok(Outcome::Help) => {
+            cli::print_usage();
+            return Ok(exit::NOERROR);
         }
-        ParseOutcome::Version => {
+        Ok(Outcome::Version) => {
             cli::print_version();
-            return Ok(0);
+            return Ok(exit::NOERROR);
         }
-        ParseOutcome::Run(cli) => cli,
+        Ok(Outcome::NoCommand) => {
+            cli::print_usage();
+            return Ok(exit::NOERROR);
+        }
+        Ok(Outcome::Run(cli)) => cli,
+        Err(ParseError(code)) => {
+            eprintln!("Use \"sshpass -h\" to get help");
+            return Err(code);
+        }
     };
 
-    let secret = Arc::new(password::resolve(&cli.password)?);
-    let program = which::resolve(&cli.program)?;
+    let secret = match password::resolve(&cli.password) {
+        Ok(secret) => Arc::new(secret),
+        Err(message) => {
+            eprintln!("{message}");
+            return Err(exit::RUNTIME_ERROR);
+        }
+    };
+
+    let program = match which::resolve(&cli.program) {
+        Ok(program) => program,
+        Err(message) => {
+            eprintln!("SSHPASS: Failed to run command: {message}");
+            return Err(exit::RUNTIME_ERROR);
+        }
+    };
 
     if let Ok(current) = std::env::current_exe() {
         if current == program.path {
-            return Err("refusing to run sshpass recursively".to_string());
+            eprintln!("SSHPASS: refusing to run sshpass recursively");
+            return Err(exit::RUNTIME_ERROR);
         }
     }
 
-    if cli.verbose {
-        eprintln!("sshpass: password source: {}", password::describe(&cli.password));
-        eprintln!("sshpass: program: {}", program.path.display());
-    }
+    let engine = match engine::choose(&cli, &program) {
+        Ok(engine) => engine,
+        Err(message) => {
+            eprintln!("{message}");
+            return Err(exit::INVALID_ARGUMENTS);
+        }
+    };
 
-    let engine = engine::choose(&program, cli.verbose)?;
-    engine::run(engine, &cli, &program.path, secret, cli.verbose)
+    match engine::run(engine, &cli, &program.path, secret, cli.verbose > 0) {
+        Ok(code) => Ok(code),
+        Err(message) => {
+            eprintln!("{message}");
+            Err(exit::RUNTIME_ERROR)
+        }
+    }
 }
 
 fn normalize_exit_code(code: i32) -> u8 {
-    // Windows exit codes are 32-bit; the process exit status is an 8-bit
-    // value in Rust's ExitCode.  Preserve the low byte, which is what shells
-    // and DSH report for ordinary command failures.
-    (code & 0xff) as u8
+    // Windows exit codes are 32-bit; Rust's ExitCode is 8-bit. ssh only uses
+    // 0-255, so clamp anything else instead of silently wrapping 256 to 0.
+    if code < 0 {
+        255
+    } else {
+        code.min(255) as u8
+    }
 }

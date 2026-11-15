@@ -1,96 +1,88 @@
 //! Password-prompt detection.
 //!
+//! sshpass looks for `assword` (the built-in `PASSWORD_PROMPT`) or a caller
+//! supplied `-P` string. It also watches for the "unknown host key" message.
+//!
 //! A pty stream contains ANSI escape sequences, carriage returns and screen
-//! updates.  We keep a short rolling window of *printable* output and look for
-//! sshpass's default marker (`assword`, which matches both `Password:` and
-//! `password:`) or a caller-supplied `-P` string.
+//! updates, so matching runs on a short rolling window of printable output.
 
-use std::time::{Duration, Instant};
+pub const DEFAULT_PROMPT: &str = "assword";
+pub const HOST_KEY_UNKNOWN: &str = "The authenticity of host ";
 
-const DEFAULT_MARKERS: [&str; 2] = ["assword", "passphrase"];
-const TAIL_LIMIT: usize = 4096;
-const MAX_SENDS: usize = 3;
-const SEND_COOLDOWN: Duration = Duration::from_millis(400);
-
-#[derive(Debug)]
-pub struct PromptScanner {
-    tail: String,
-    custom: Option<String>,
-    sends: usize,
-    last_send: Option<Instant>,
-}
-
-impl PromptScanner {
-    pub fn new(custom: Option<String>) -> Self {
-        Self {
-            tail: String::new(),
-            custom,
-            sends: 0,
-            last_send: None,
-        }
-    }
-
-    pub fn sends(&self) -> usize {
-        self.sends
-    }
-
-    /// Feed output bytes.  Returns true exactly when the password should be
-    /// written to the child.
-    pub fn feed(&mut self, bytes: &[u8]) -> bool {
-        let text = strip_ansi(bytes);
-        if text.is_empty() {
-            return false;
-        }
-        self.tail.push_str(&text);
-        if self.tail.len() > TAIL_LIMIT {
-            let mut cut = self.tail.len() - TAIL_LIMIT;
-            while cut < self.tail.len() && !self.tail.is_char_boundary(cut) {
-                cut += 1;
-            }
-            self.tail.drain(..cut);
-        }
-
-        if self.sends >= MAX_SENDS {
-            return false;
-        }
-        if let Some(last) = self.last_send {
-            if last.elapsed() < SEND_COOLDOWN {
-                return false;
-            }
-        }
-        if !prompt_matches(&self.tail, self.custom.as_deref()) {
-            return false;
-        }
-
-        self.sends += 1;
-        self.last_send = Some(Instant::now());
-        // The prompt has been answered; drop it so a later chunk that still
-        // contains the old text does not cause a duplicate send.
-        self.tail.clear();
-        true
-    }
-}
-
-pub fn prompt_matches(text: &str, custom: Option<&str>) -> bool {
-    if let Some(custom) = custom {
-        return text.contains(custom);
-    }
-    let lower = text.to_lowercase();
-    DEFAULT_MARKERS.iter().any(|marker| lower.contains(marker))
+pub fn prompt_matches(text: &str, custom: &str) -> bool {
+    // -P replaces the marker entirely; otherwise sshpass's default is used.
+    text.contains(custom)
 }
 
 pub fn is_host_key_prompt(text: &str) -> bool {
+    text.contains(HOST_KEY_UNKNOWN)
+}
+
+/// The interactive wording ssh uses when it asks whether to trust a new host
+/// key. askpass helpers can be invoked for this prompt, and a password must
+/// never be typed as the answer.
+pub fn is_host_key_question(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("yes/no")
         || lower.contains("continue connecting")
-        || lower.contains("authenticity")
         || lower.contains("fingerprint")
+        || lower.contains("authenticity")
+}
+
+/// Remove ConPTY's own decorations: the window title it sets to the child
+/// executable's path, and the input/focus-mode toggles it emits. Legitimate
+/// application output (including remote OSC titles and colours) is preserved.
+pub fn strip_conpty_noise(bytes: &[u8]) -> Vec<u8> {
+    const TOGGLES: [&[u8]; 6] = [
+        b"\x1b[?9001h",
+        b"\x1b[?9001l",
+        b"\x1b[?1004h",
+        b"\x1b[?1004l",
+        b"\x1b[?25h",
+        b"\x1b[?25l",
+    ];
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            let start = i;
+            let mut end = i + 2;
+            let mut terminator = None;
+            while end < bytes.len() {
+                if bytes[end] == 0x07 {
+                    terminator = Some(end + 1);
+                    break;
+                }
+                if bytes[end] == 0x1b && end + 1 < bytes.len() && bytes[end + 1] == b'\\' {
+                    terminator = Some(end + 2);
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(end) = terminator {
+                let payload = String::from_utf8_lossy(&bytes[start + 2..end]);
+                let lower = payload.to_lowercase();
+                let is_conpty_title = payload.starts_with("0;")
+                    && (payload.contains(":\\") || lower.contains(".exe"));
+                if !is_conpty_title {
+                    out.extend_from_slice(&bytes[start..end]);
+                }
+                i = end;
+                continue;
+            }
+        }
+        if let Some(toggle) = TOGGLES.iter().find(|seq| bytes[i..].starts_with(seq)) {
+            i += toggle.len();
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Remove ConPTY's cursor-position query (`ESC [ 6 n`) from the output stream.
-/// portable-pty asks for this query because it creates the pseudo console with
-/// PSEUDOCONSOLE_INHERIT_CURSOR; we answer it internally, so it must not reach
-/// the caller's terminal as literal garbage.
 pub fn strip_cursor_query(bytes: &[u8]) -> Vec<u8> {
     let needle = b"\x1b[6n";
     let mut out = Vec::with_capacity(bytes.len());
@@ -106,12 +98,12 @@ pub fn strip_cursor_query(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Removes the password from output emitted after it was typed.
+/// Removes the password from the terminal echo that follows typing it.
 ///
-/// Real ssh reads a password with console echo disabled, but arbitrary console
-/// programs may echo it.  Original sshpass disables ECHO on its pty; ConPTY has
-/// no master-side termios, so we redact the exact password instead.  This is a
-/// best-effort safety net; it also keeps `-v`/logs free of the secret.
+/// OpenSSH disables console echo while reading the password, but an arbitrary
+/// console program may echo it. Original sshpass disables ECHO on its pty;
+/// ConPTY has no master-side termios, so we redact the exact password until
+/// the end of the line that carries the echo, then relay everything normally.
 pub struct Redactor {
     secret: Vec<u8>,
     active: bool,
@@ -128,17 +120,32 @@ impl Redactor {
     }
 
     pub fn activate(&mut self) {
+        if self.secret.is_empty() {
+            self.active = false;
+            return;
+        }
         self.active = true;
+        self.carry.clear();
     }
 
     pub fn filter(&mut self, chunk: &[u8]) -> Vec<u8> {
-        if !self.active || self.secret.is_empty() {
+        if !self.active {
             return chunk.to_vec();
         }
         self.carry.extend_from_slice(chunk);
 
-        // Hold back a trailing partial password so a password split across
-        // reads is still removed as a unit.
+        // The echo is a single line. Redact only up to its newline; everything
+        // after that is ordinary program output and must pass through intact
+        // (even if it happens to contain the password text).
+        if let Some(newline) = self.carry.iter().position(|byte| *byte == b'\n') {
+            let mut out = remove_all(&self.carry[..=newline], &self.secret);
+            out.extend_from_slice(&self.carry[newline + 1..]);
+            self.active = false;
+            self.carry.clear();
+            return out;
+        }
+
+        // Hold a trailing partial password for the next chunk.
         let mut keep = 0usize;
         for candidate in (1..self.secret.len().min(self.carry.len()) + 1).rev() {
             if self.carry[self.carry.len() - candidate..] == self.secret[..candidate] {
@@ -147,31 +154,37 @@ impl Redactor {
             }
         }
         let process_len = self.carry.len() - keep;
-
-        let mut out = Vec::with_capacity(process_len);
-        let mut i = 0usize;
-        while i < process_len {
-            if i + self.secret.len() <= process_len
-                && self.carry[i..i + self.secret.len()] == self.secret
-            {
-                i += self.secret.len();
-            } else {
-                out.push(self.carry[i]);
-                i += 1;
-            }
-        }
+        let out = remove_all(&self.carry[..process_len], &self.secret);
         self.carry = self.carry[process_len..].to_vec();
         out
     }
 
     pub fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.carry)
+        let out = std::mem::take(&mut self.carry);
+        self.active = false;
+        out
     }
 }
 
+fn remove_all(haystack: &[u8], needle: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0usize;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// Remove ANSI CSI/OSC sequences so prompt matching is not confused by color
-/// or cursor-control codes.  UTF-8 text is preserved byte-for-byte otherwise.
+/// or cursor-control codes. UTF-8 text is preserved byte-for-byte otherwise.
 pub fn strip_ansi(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -187,7 +200,6 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
         }
         match bytes[i] {
             b'[' => {
-                // CSI: ESC [ ... final byte 0x40..=0x7e
                 i += 1;
                 while i < bytes.len() {
                     let b = bytes[i];
@@ -198,7 +210,6 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
                 }
             }
             b']' => {
-                // OSC: ESC ] ... BEL or ESC \
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == 0x07 {
@@ -212,10 +223,7 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
                     i += 1;
                 }
             }
-            _ => {
-                // Two-byte escape (e.g. ESC ( B, ESC 7).
-                i += 1;
-            }
+            _ => i += 1,
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -238,53 +246,24 @@ mod tests {
     }
 
     #[test]
-    fn matches_default_password_prompts() {
-        assert!(prompt_matches("root@host's password: ", None));
-        assert!(prompt_matches("Password:", None));
-        assert!(prompt_matches("Enter passphrase for key: ", None));
-        assert!(!prompt_matches("Welcome to the machine\r\n", None));
+    fn matches_default_prompts() {
+        assert!(prompt_matches("root@host's password: ", DEFAULT_PROMPT));
+        assert!(prompt_matches("Password:", DEFAULT_PROMPT));
+        assert!(!prompt_matches("Welcome\r\n", DEFAULT_PROMPT));
     }
 
     #[test]
-    fn matches_custom_prompt() {
-        assert!(prompt_matches("Mot de passe: ", Some("Mot de passe")));
-        assert!(!prompt_matches("Password: ", Some("Mot de passe")));
+    fn custom_prompt_replaces_default() {
+        assert!(prompt_matches("Mot de passe: ", "Mot de passe"));
+        assert!(!prompt_matches("Password: ", "Mot de passe"));
     }
 
     #[test]
-    fn detects_host_key_prompts() {
+    fn detects_host_key_message() {
         assert!(is_host_key_prompt(
-            "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            "The authenticity of host 'x' can't be established."
         ));
-        assert!(is_host_key_prompt("The authenticity of host 'x' can't be established."));
         assert!(!is_host_key_prompt("root@host's password: "));
-    }
-
-    #[test]
-    fn scanner_sends_once_per_prompt() {
-        let mut scanner = PromptScanner::new(None);
-        assert!(!scanner.feed(b"Welcome\r\n"));
-        assert!(scanner.feed(b"root@host's password: "));
-        assert_eq!(scanner.sends(), 1);
-        // Immediate duplicate is suppressed by the cooldown.
-        assert!(!scanner.feed(b"password: "));
-    }
-
-    #[test]
-    fn scanner_handles_split_prompt() {
-        let mut scanner = PromptScanner::new(None);
-        assert!(!scanner.feed(b"root@host's pass"));
-        assert!(scanner.feed(b"word: "));
-    }
-
-    #[test]
-    fn scanner_stops_after_three_sends() {
-        let mut scanner = PromptScanner::new(None);
-        for _ in 0..5 {
-            std::thread::sleep(SEND_COOLDOWN + Duration::from_millis(10));
-            scanner.feed(b"Password: ");
-        }
-        assert_eq!(scanner.sends(), 3);
     }
 
     #[test]
@@ -294,22 +273,38 @@ mod tests {
     }
 
     #[test]
-    fn redactor_removes_password() {
-        let mut redactor = Redactor::new(b"secret");
+    fn strips_conpty_decorations_only() {
+        assert_eq!(
+            strip_conpty_noise(b"\x1b]0;C:\\Windows\\ssh.exe\x07hello"),
+            b"hello"
+        );
+        assert_eq!(strip_conpty_noise(b"\x1b[?9001hhello\x1b[?9001l"), b"hello");
+        // A remote title (no Windows path / .exe) is legitimate output.
+        assert_eq!(
+            strip_conpty_noise(b"\x1b]0;my-server\x07hello"),
+            b"\x1b]0;my-server\x07hello"
+        );
+    }
+
+    #[test]
+    fn redactor_removes_only_the_echo_line() {
+        let mut redactor = Redactor::new(b"K");
         redactor.activate();
-        assert_eq!(redactor.filter(b"Password: secret\r\n"), b"Password: \r\n");
+        assert_eq!(redactor.filter(b"K\r\nAUTH_OK\r\n"), b"\r\nAUTH_OK\r\n");
+        // Once the echo line is gone, redaction is off.
+        assert_eq!(redactor.filter(b"AUTH_OK\r\n"), b"AUTH_OK\r\n");
     }
 
     #[test]
     fn redactor_handles_split_password() {
         let mut redactor = Redactor::new(b"secret");
         redactor.activate();
-        assert_eq!(redactor.filter(b"Password: sec"), b"Password: ");
-        assert_eq!(redactor.filter(b"ret\r\n"), b"\r\n");
+        assert_eq!(redactor.filter(b"sec"), b"");
+        assert_eq!(redactor.filter(b"ret\r\nOK"), b"\r\nOK");
     }
 
     #[test]
-    fn redactor_passes_through_other_output() {
+    fn redactor_passes_other_output() {
         let mut redactor = Redactor::new(b"secret");
         redactor.activate();
         assert_eq!(redactor.filter(b"hello\r\n"), b"hello\r\n");

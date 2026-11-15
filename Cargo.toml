@@ -27,15 +27,21 @@ doc = false
 name = "fake-prompt"
 path = "src/bin/fake_prompt.rs"
 doc = false
+required-features = ["test-helpers"]
 
 [[bin]]
 name = "fake-input"
 path = "src/bin/fake_input.rs"
 doc = false
+required-features = ["test-helpers"]
 
 [dependencies]
 portable-pty = "0.9"
 ctrlc = "3"
+
+[features]
+default = []
+test-helpers = []
 
 [profile.release]
 panic = "abort"
