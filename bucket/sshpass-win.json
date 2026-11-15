@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/zsyn666/sshpass-win/releases/download/v1.0.0/sshpass.exe",
-      "hash": "cee51ffa19f018ac5e8daba2a01ca7583a0eb5c72ed0b0d66b50ef1a3e533558"
+      "hash": "357e6e8d041ffc26d99c14e1a90854a94186f1b33e1918c3515558fd9e58306f"
     }
   },
   "bin": "sshpass.exe",
